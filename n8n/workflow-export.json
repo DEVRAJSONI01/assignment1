@@ -1,0 +1,247 @@
+{
+  "name": "Chatbot Integration Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "chatbot",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "chatbot-webhook"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Extract and validate incoming data\nconst chatId = $input.first().json.body.chatId;\nconst message = $input.first().json.body.message;\nconst userId = $input.first().json.body.userId;\nconst userRole = $input.first().json.body.userRole;\n\n// Basic validation\nif (!chatId || !message || !userId) {\n  throw new Error('Missing required fields: chatId, message, or userId');\n}\n\nif (userRole !== 'user') {\n  throw new Error('Unauthorized: Invalid user role');\n}\n\nreturn [{\n  json: {\n    chatId,\n    message,\n    userId,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "validate-input",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HASURA_GRAPHQL_ENDPOINT }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "x-hasura-admin-secret",
+              "value": "={{ $credentials.hasuraAdminSecret.headerValue }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "query CheckChatOwnership($chatId: uuid!, $userId: uuid!) { chats(where: {id: {_eq: $chatId}, user_id: {_eq: $userId}}) { id user_id } }"
+            },
+            {
+              "name": "variables",
+              "value": "={{ { \"chatId\": $json.chatId, \"userId\": $json.userId } }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "check-ownership",
+      "name": "Check Chat Ownership",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Verify chat ownership\nconst response = $input.first().json;\nconst chats = response.data?.chats || [];\n\nif (chats.length === 0) {\n  throw new Error('Unauthorized: User does not own this chat');\n}\n\nconst chat = chats[0];\nif (chat.user_id !== $('Validate Input').first().json.userId) {\n  throw new Error('Unauthorized: Chat ownership mismatch');\n}\n\nreturn [{\n  json: {\n    chatId: $('Validate Input').first().json.chatId,\n    message: $('Validate Input').first().json.message,\n    userId: $('Validate Input').first().json.userId,\n    authorized: true,\n    timestamp: $('Validate Input').first().json.timestamp\n  }\n}];"
+      },
+      "id": "verify-ownership",
+      "name": "Verify Ownership",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.openrouterApiKey.headerValue }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "mistralai/mistral-7b-instruct:free"
+            },
+            {
+              "name": "messages",
+              "value": "={{ [ { \"role\": \"system\", \"content\": \"You are a helpful AI assistant. Provide clear, concise, and helpful responses. Keep responses under 500 characters when possible.\" }, { \"role\": \"user\", \"content\": $json.message } ] }}"
+            },
+            {
+              "name": "max_tokens",
+              "value": 500
+            },
+            {
+              "name": "temperature",
+              "value": 0.7
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "call-openrouter",
+      "name": "Call OpenRouter API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Extract AI response\nconst response = $input.first().json;\nconst assistantMessage = response.choices?.[0]?.message?.content || 'Sorry, I could not generate a response.';\n\n// Clean up the response\nconst cleanMessage = assistantMessage.trim();\n\nreturn [{\n  json: {\n    chatId: $('Verify Ownership').first().json.chatId,\n    userId: $('Verify Ownership').first().json.userId,\n    assistantMessage: cleanMessage,\n    originalResponse: response,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "process-response",
+      "name": "Process AI Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HASURA_GRAPHQL_ENDPOINT }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "x-hasura-admin-secret",
+              "value": "={{ $credentials.hasuraAdminSecret.headerValue }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "mutation InsertAssistantMessage($chatId: uuid!, $userId: uuid!, $content: String!) { insert_messages_one(object: {chat_id: $chatId, user_id: $userId, content: $content, role: \"assistant\"}) { id content role created_at } }"
+            },
+            {
+              "name": "variables",
+              "value": "={{ { \"chatId\": $json.chatId, \"userId\": $json.userId, \"content\": $json.assistantMessage } }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "save-to-database",
+      "name": "Save Response to Database",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Format final response for Hasura Action\nconst assistantMessage = $('Process AI Response').first().json.assistantMessage;\nconst saveResult = $input.first().json;\n\n// Check if message was saved successfully\nconst success = saveResult.data?.insert_messages_one?.id ? true : false;\nconst error = success ? null : 'Failed to save message to database';\n\nreturn [{\n  json: {\n    response: assistantMessage,\n    success: success,\n    error: error,\n    messageId: saveResult.data?.insert_messages_one?.id || null,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "format-response",
+      "name": "Format Final Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}"
+      },
+      "id": "webhook-response",
+      "name": "Send Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2000, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Global error handler\nconst error = $input.first().error || {};\nconst errorMessage = error.message || 'An unknown error occurred';\n\nconsole.error('Workflow error:', error);\n\nreturn [{\n  json: {\n    response: null,\n    success: false,\n    error: errorMessage,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "error-handler",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1000, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}"
+      },
+      "id": "error-response",
+      "name": "Send Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1220, 500]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [[{"node": "Validate Input", "type": "main", "index": 0}]]
+    },
+    "Validate Input": {
+      "main": [[{"node": "Check Chat Ownership", "type": "main", "index": 0}]]
+    },
+    "Check Chat Ownership": {
+      "main": [[{"node": "Verify Ownership", "type": "main", "index": 0}]]
+    },
+    "Verify Ownership": {
+      "main": [[{"node": "Call OpenRouter API", "type": "main", "index": 0}]]
+    },
+    "Call OpenRouter API": {
+      "main": [[{"node": "Process AI Response", "type": "main", "index": 0}]]
+    },
+    "Process AI Response": {
+      "main": [[{"node": "Save Response to Database", "type": "main", "index": 0}]]
+    },
+    "Save Response to Database": {
+      "main": [[{"node": "Format Final Response", "type": "main", "index": 0}]]
+    },
+    "Format Final Response": {
+      "main": [[{"node": "Send Response", "type": "main", "index": 0}]]
+    },
+    "Error Handler": {
+      "main": [[{"node": "Send Error Response", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "errorWorkflow": {
+      "callerPolicy": "workflowSettings"
+    },
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  }
+}
